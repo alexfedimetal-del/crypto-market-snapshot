@@ -5,10 +5,9 @@ from typing import Optional, Dict, Any
 import httpx
 from fastapi import FastAPI, Query, HTTPException
 
-app = FastAPI(title="Trading Desk Market Snapshot API", version="1.0.0")
+app = FastAPI(title="Trading Desk Market Snapshot API", version="1.1.0")
 
-BINANCE_SPOT_BASE = os.getenv("BINANCE_SPOT_BASE", "https://api.binance.com")
-BINANCE_FUTURES_BASE = os.getenv("BINANCE_FUTURES_BASE", "https://fapi.binance.com")
+BYBIT_BASE = os.getenv("BYBIT_BASE", "https://api.bybit.com")
 
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "8"))
 _cache: Dict[str, Dict[str, Any]] = {}
@@ -33,14 +32,30 @@ def _vol_regime_from_change(pct_change_24h: float) -> str:
         return "medium"
     return "high"
 
-def _liquidity_condition_from_volume(volume_24h_quote: float) -> str:
-    if volume_24h_quote <= 0:
+def _liquidity_condition_from_turnover(turnover_24h: float) -> str:
+    if turnover_24h <= 0:
         return "thin"
-    if volume_24h_quote < 50_000_000:
+    if turnover_24h < 50_000_000:
         return "thin"
-    if volume_24h_quote < 300_000_000:
+    if turnover_24h < 300_000_000:
         return "normal"
     return "crowded"
+
+def _normalize_symbol(symbol: str) -> str:
+    s = symbol.strip().upper()
+    if not s.isalnum():
+        raise ValueError("Invalid symbol format")
+    return s
+
+async def _bybit_get(client: httpx.AsyncClient, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{BYBIT_BASE}{path}"
+    r = await client.get(url, params=params)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Bybit upstream error: {r.text}")
+    data = r.json()
+    if isinstance(data, dict) and data.get("retCode") not in (0, None):
+        raise HTTPException(status_code=502, detail=f"Bybit retCode error: {data}")
+    return data
 
 @app.get("/")
 def health():
@@ -48,80 +63,65 @@ def health():
 
 @app.get("/market_snapshot")
 async def market_snapshot(
-    symbol: str = Query(..., description="Trading pair, e.g. BTCUSDT, ETHUSDT"),
-    exchange: str = Query("binance", description="Venue label"),
-    timeframe: Optional[str] = Query(None, description="Optional timeframe label, e.g. 4H, 1D"),
+    symbol: str = Query(..., description="e.g. BTCUSDT, ETHUSDT"),
+    exchange: str = Query("bybit"),
+    timeframe: Optional[str] = Query(None),
 ):
-    if not symbol.isalnum():
-        raise HTTPException(status_code=400, detail="Invalid symbol format.")
+    try:
+        sym = _normalize_symbol(symbol)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    key = f"{exchange}:{symbol}:{timeframe or ''}"
+    key = f"{exchange}:{sym}:{timeframe or ''}"
     cached = _cache_get(key)
     if cached:
         return cached
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        # Spot 24h ticker
-        spot_resp = await client.get(
-            f"{BINANCE_SPOT_BASE}/api/v3/ticker/24hr",
-            params={"symbol": symbol},
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        ticker = await _bybit_get(
+            client,
+            "/v5/market/tickers",
+            {"category": "linear", "symbol": sym},
         )
-        if spot_resp.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Spot upstream error: {spot_resp.text}")
-        spot = spot_resp.json()
+        lst = ticker.get("result", {}).get("list", [])
+        if not lst:
+            raise HTTPException(status_code=502, detail=f"No ticker data for {sym}")
+        t0 = lst[0]
 
-        try:
-            price = float(spot["lastPrice"])
-            volume_24h_quote = float(spot["quoteVolume"])
-            price_change_24h = float(spot["priceChangePercent"])
-        except Exception:
-            raise HTTPException(status_code=502, detail="Unexpected spot payload format.")
+        price = float(t0["lastPrice"])
+        price_change_24h = float(t0.get("price24hPcnt", 0.0)) * 100.0
+        turnover_24h = float(t0.get("turnover24h", 0.0))
 
-        # Futures Open Interest (may fail if symbol not listed on futures)
-        open_interest = None
-        oi_resp = await client.get(
-            f"{BINANCE_FUTURES_BASE}/fapi/v1/openInterest",
-            params={"symbol": symbol},
+        oi = await _bybit_get(
+            client,
+            "/v5/market/open-interest",
+            {"category": "linear", "symbol": sym, "intervalTime": "5min", "limit": 1},
         )
-        if oi_resp.status_code == 200:
-            oi = oi_resp.json()
-            try:
-                open_interest = float(oi.get("openInterest"))
-            except Exception:
-                open_interest = None
+        oi_list = oi.get("result", {}).get("list", [])
+        open_interest = float(oi_list[0]["openInterest"]) if oi_list else None
 
-        # Futures Funding Rate (latest)
-        funding_rate = None
-        fr_resp = await client.get(
-            f"{BINANCE_FUTURES_BASE}/fapi/v1/fundingRate",
-            params={"symbol": symbol, "limit": 1},
+        fr = await _bybit_get(
+            client,
+            "/v5/market/funding/history",
+            {"category": "linear", "symbol": sym, "limit": 1},
         )
-        if fr_resp.status_code == 200:
-            fr = fr_resp.json()
-            if isinstance(fr, list) and fr:
-                try:
-                    funding_rate = float(fr[0].get("fundingRate"))
-                except Exception:
-                    funding_rate = None
-
-    volatility_regime = _vol_regime_from_change(price_change_24h)
-    liquidity_condition = _liquidity_condition_from_volume(volume_24h_quote)
+        fr_list = fr.get("result", {}).get("list", [])
+        funding_rate = float(fr_list[0]["fundingRate"]) if fr_list else None
 
     result = {
-        "symbol": symbol,
+        "symbol": sym,
         "exchange": exchange,
         "price": price,
         "price_change_24h": price_change_24h,
-        "volume_24h": volume_24h_quote,
+        "volume_24h": turnover_24h,
         "funding_rate": funding_rate,
         "open_interest": open_interest,
-        "oi_change": None,
-        "long_short_ratio": None,
-        "volatility_regime": volatility_regime,
-        "liquidity_condition": liquidity_condition,
+        "volatility_regime": _vol_regime_from_change(price_change_24h),
+        "liquidity_condition": _liquidity_condition_from_turnover(turnover_24h),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "source": "binance"
+        "source": "bybit",
     }
 
     _cache_set(key, result)
     return result
+
